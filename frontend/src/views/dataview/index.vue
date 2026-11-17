@@ -63,6 +63,36 @@
       </tbody>
     </table>
 
+    <section class="panel">
+      <h3>复核清单</h3>
+      <p class="page-desc">
+        评审中的分析视图随回访分析视图数据快照增量更新；分享入口只指向一个完整快照版本，历史版本在回访分析页回看。
+      </p>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>视图编号</th>
+            <th>视图名称</th>
+            <th>当前状态</th>
+            <th>快照版本</th>
+            <th>分享入口</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="item in reviewQueue" :key="String(item.row.id)">
+            <td>{{ item.row['视图编号'] }}</td>
+            <td>{{ item.row['视图名称'] }}</td>
+            <td>{{ item.row.status }}</td>
+            <td>{{ item.snapshotVersion ? `v${item.snapshotVersion}` : '未固化' }}</td>
+            <td>{{ item.shareEntry || '—' }}</td>
+          </tr>
+          <tr v-if="!reviewQueue.length">
+            <td colspan="5" class="empty-state">复核清单为空：没有评审中的分析视图</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
     <footer class="page-foot">
       <span>共 {{ total }} 条数据视图记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
@@ -77,8 +107,10 @@ import {
   downloadEntries,
   listEntries,
   moduleMeta,
+  retentionViewReviewQueue,
   runAction as applyAction,
 } from '@/api/local-service'
+import type { ReviewQueueItem } from '@/data/retention-snapshots'
 import type { EntryRow } from '@/data/types'
 
 const meta = moduleMeta('dataview')
@@ -92,6 +124,8 @@ const total = ref(0)
 const errorMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
+// 复核清单：评审中的分析视图，随回访视图快照增量更新
+const reviewQueue = ref<ReviewQueueItem[]>([])
 const statusSummary = computed(() =>
   statuses.map((status: string) => ({
     status,
@@ -128,6 +162,7 @@ function reload() {
     const payload = listEntries(meta.key, filters.value)
     rows.value = payload.items
     total.value = payload.total
+    reviewQueue.value = retentionViewReviewQueue()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '数据视图列表读取失败'
   }

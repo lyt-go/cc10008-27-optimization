@@ -1,5 +1,25 @@
 import { MODULE_BY_KEY } from '@/data/modules'
 import { allRows, listRows, resetRows, saveRows } from '@/data/local-store'
+import {
+  CURVE_METRICS,
+  activeSnapshot,
+  arbitrateConflict,
+  computeSnapshot,
+  listSnapshots,
+  listViewCandidates,
+  resetRetentionViewSnapshots,
+  retentionReviewQueue,
+  shareEntry,
+} from '@/data/retention-snapshots'
+import type {
+  ArbitrationResult,
+  ConflictStrategy,
+  RetentionViewSnapshot,
+  ReviewQueueItem,
+  SnapshotComputeResult,
+  SnapshotQuery,
+  ViewCandidate,
+} from '@/data/retention-snapshots'
 import type { ActionResult, EntryRow, ModuleMeta, OverviewResult, PageResult } from '@/data/types'
 
 // 会写进数据的「往回走」动作：命中就把这条记录标成异常态，看板上能一眼看出来。
@@ -102,4 +122,65 @@ export function loadOverview(): OverviewResult {
     { label: '异常量', value: modules.reduce((sum, item) => sum + item.abnormal, 0) },
   ]
   return { cards, modules }
+}
+
+// ===== 回访分析视图数据快照：局部更新、去重、并发与版本冲突仲裁 =====
+// 页面只调这里；引擎在 data/retention-snapshots.ts，回访曲线从回访分析流向数据视图。
+
+export const RETENTION_CURVE_METRICS: readonly string[] = CURVE_METRICS
+
+/** 回访视图快照版本列表（新的在前），历史快照都可回看。 */
+export function listRetentionViewSnapshots(viewKey: string): RetentionViewSnapshot[] {
+  return listSnapshots(viewKey)
+}
+
+/** 当前分享入口指向的完整快照版本。 */
+export function activeRetentionSnapshot(viewKey: string): RetentionViewSnapshot | null {
+  return activeSnapshot(viewKey)
+}
+
+/** 分享入口文本：同一入口只指向一个完整快照版本。 */
+export function retentionSnapshotShareEntry(viewKey: string): string {
+  return shareEntry(viewKey)
+}
+
+/** 可挂载回访视图快照的分析视图（数据视图模块里未删除的行）。 */
+export function retentionViewCandidates(): ViewCandidate[] {
+  return listViewCandidates()
+}
+
+/**
+ * 增量更新回访分析视图数据快照：只重算受影响曲线，稳定部分复用上版、历史边界不变；
+ * 相同查询条件 + 度量修订 + 源数据去重复用；并发提交只留首份，其余照旧返回。
+ */
+export function computeRetentionViewSnapshot(
+  viewKey: string,
+  query: SnapshotQuery,
+  metricRevision: string,
+): Promise<SnapshotComputeResult> {
+  return computeSnapshot({ viewKey, query, metricRevision })
+}
+
+/**
+ * 版本冲突仲裁：查询条件更新与迟到度量修订同时影响同一回访视图时，
+ * 沿「受影响曲线增量」产出局部曲线刷新 + 旧快照保留清单，
+ * 或沿「整套度量重算」产出新度量完整快照 + 旧报告冻结清单。
+ */
+export function arbitrateRetentionViewConflict(
+  viewKey: string,
+  queryUpdate: SnapshotQuery,
+  lateMetricRevision: string,
+  strategy: ConflictStrategy,
+): Promise<ArbitrationResult> {
+  return arbitrateConflict(viewKey, queryUpdate, lateMetricRevision, strategy)
+}
+
+/** 数据视图模块的复核清单：评审中的分析视图随快照增量更新。 */
+export function retentionViewReviewQueue(): ReviewQueueItem[] {
+  return retentionReviewQueue()
+}
+
+/** 清空全部回访视图快照，并摘掉数据视图行上的快照分享链接。 */
+export function resetRetentionSnapshots(): void {
+  resetRetentionViewSnapshots()
 }

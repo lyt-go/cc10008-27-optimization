@@ -63,6 +63,102 @@
       </tbody>
     </table>
 
+    <section class="panel">
+      <h3>回访视图快照</h3>
+      <p class="page-desc">
+        查询条件取自上方筛选栏；增量更新只重算受影响曲线，未受影响的回访模式继续读取上一完整回访曲线，历史边界保持不变。
+      </p>
+      <div class="panel-controls">
+        <label>
+          <span>分析视图</span>
+          <select v-model="viewKey">
+            <option v-for="item in viewCandidates" :key="item.viewKey" :value="item.viewKey">
+              {{ item.viewKey }} · {{ item.name }}（{{ item.status }}）
+            </option>
+          </select>
+        </label>
+        <label>
+          <span>度量修订号</span>
+          <input v-model="metricRevision" placeholder="如 M1" />
+        </label>
+        <button class="btn primary" type="button" @click="computeSnapshot">增量更新快照</button>
+        <button class="btn" type="button" @click="computeConcurrent">并发提交两次</button>
+      </div>
+      <div class="panel-controls">
+        <label>
+          <span>迟到度量修订号</span>
+          <input v-model="lateMetricRevision" placeholder="如 M2" />
+        </label>
+        <label>
+          <span>仲裁策略</span>
+          <select v-model="strategy">
+            <option value="incremental">受影响曲线增量（局部刷新 + 旧快照保留清单）</option>
+            <option value="full-recompute">整套度量重算（新完整快照 + 旧报告冻结清单）</option>
+          </select>
+        </label>
+        <button class="btn" type="button" @click="arbitrate">执行版本冲突仲裁</button>
+        <button class="btn ghost" type="button" @click="resetSnapshots">清空快照</button>
+      </div>
+      <p v-if="snapshotMessage" class="panel-message">{{ snapshotMessage }}</p>
+      <p class="share-entry">分享入口：{{ shareEntryText || '尚未固化快照' }}</p>
+
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>版本</th>
+            <th>状态</th>
+            <th>查询签名</th>
+            <th>度量修订</th>
+            <th>重算曲线</th>
+            <th>复用曲线</th>
+            <th>固化时间</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="snap in snapshots" :key="snap.id">
+            <td>v{{ snap.version }}</td>
+            <td><span class="tag" :class="snap.status">{{ statusLabel(snap.status) }}</span></td>
+            <td>{{ snap.querySignature }}</td>
+            <td>{{ snap.metricRevision }}</td>
+            <td>{{ snap.refreshedKeys.length }}</td>
+            <td>{{ snap.reusedKeys.length }}</td>
+            <td>{{ formatTime(snap.createdAt) }}</td>
+            <td><button class="link" type="button" @click="reviewSnapshot(snap)">回看</button></td>
+          </tr>
+          <tr v-if="!snapshots.length">
+            <td colspan="8" class="empty-state">暂无快照，切换查询条件后点「增量更新快照」</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div v-if="reviewing" class="curve-panel">
+        <h4>快照 v{{ reviewing.version }} 曲线明细（{{ statusLabel(reviewing.status) }}）</h4>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>曲线</th>
+              <th>用户分群</th>
+              <th>度量</th>
+              <th>历史边界</th>
+              <th>曲线点</th>
+              <th>来源</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="curve in reviewing.curves" :key="curve.curveKey">
+              <td>{{ curve.curveKey }}</td>
+              <td>{{ curve.cohort }}</td>
+              <td>{{ curve.metric }}</td>
+              <td>{{ curve.boundary }}</td>
+              <td>{{ curve.points.join(' → ') }}</td>
+              <td>{{ curve.reused ? '复用上版（未受影响）' : '本版重算' }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <footer class="page-foot">
       <span>共 {{ total }} 条回访分析记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
@@ -71,14 +167,26 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 
 import {
+  computeRetentionViewSnapshot,
+  arbitrateRetentionViewConflict,
   downloadEntries,
   listEntries,
+  listRetentionViewSnapshots,
   moduleMeta,
+  resetRetentionSnapshots,
+  retentionSnapshotShareEntry,
+  retentionViewCandidates,
   runAction as applyAction,
 } from '@/api/local-service'
+import type {
+  ConflictStrategy,
+  RetentionViewSnapshot,
+  SnapshotStatus,
+  ViewCandidate,
+} from '@/data/retention-snapshots'
 import type { EntryRow } from '@/data/types'
 
 const meta = moduleMeta('retention')
@@ -98,6 +206,94 @@ const statusSummary = computed(() =>
     count: rows.value.filter((row) => String(row.status) === status).length,
   })),
 )
+
+// ---- 回访视图快照：查询条件来自筛选栏，快照是分享与回看的唯一入口 ----
+
+const viewCandidates = ref<ViewCandidate[]>([])
+const viewKey = ref('')
+const metricRevision = ref('M1')
+const lateMetricRevision = ref('M2')
+const strategy = ref<ConflictStrategy>('incremental')
+const snapshots = ref<RetentionViewSnapshot[]>([])
+const reviewing = ref<RetentionViewSnapshot | null>(null)
+const snapshotMessage = ref('')
+const shareEntryText = ref('')
+
+const STATUS_LABELS: Record<SnapshotStatus, string> = {
+  active: '当前（分享指向）',
+  retained: '保留（可回看）',
+  frozen: '冻结（旧报告）',
+}
+
+function statusLabel(status: SnapshotStatus): string {
+  return STATUS_LABELS[status]
+}
+
+function formatTime(iso: string): string {
+  const date = new Date(iso)
+  return Number.isNaN(date.getTime()) ? iso : date.toLocaleString()
+}
+
+function currentQuery(): Record<string, string> {
+  return { ...filters.value }
+}
+
+async function computeSnapshot() {
+  snapshotMessage.value = ''
+  const result = await computeRetentionViewSnapshot(viewKey.value, currentQuery(), metricRevision.value)
+  snapshotMessage.value = result.message
+  refreshSnapshots()
+}
+
+async function computeConcurrent() {
+  snapshotMessage.value = ''
+  const [first, second] = await Promise.all([
+    computeRetentionViewSnapshot(viewKey.value, currentQuery(), metricRevision.value),
+    computeRetentionViewSnapshot(viewKey.value, currentQuery(), metricRevision.value),
+  ])
+  snapshotMessage.value = `首份：${first.message} ｜ 并发另一回：${second.message}`
+  refreshSnapshots()
+}
+
+async function arbitrate() {
+  snapshotMessage.value = ''
+  const result = await arbitrateRetentionViewConflict(
+    viewKey.value,
+    currentQuery(),
+    lateMetricRevision.value,
+    strategy.value,
+  )
+  snapshotMessage.value = result.message
+  metricRevision.value = lateMetricRevision.value
+  refreshSnapshots()
+}
+
+function reviewSnapshot(snap: RetentionViewSnapshot) {
+  reviewing.value = snap
+}
+
+function resetSnapshots() {
+  resetRetentionSnapshots()
+  snapshotMessage.value = '快照已清空，数据视图行的快照分享链接已一并摘除'
+  refreshSnapshots()
+}
+
+function refreshSnapshots() {
+  viewCandidates.value = retentionViewCandidates()
+  if (!viewKey.value && viewCandidates.value.length) {
+    viewKey.value = viewCandidates.value[0].viewKey
+  }
+  snapshots.value = listRetentionViewSnapshots(viewKey.value)
+  shareEntryText.value = retentionSnapshotShareEntry(viewKey.value)
+  if (reviewing.value) {
+    reviewing.value = snapshots.value.find((snap) => snap.id === reviewing.value?.id) ?? null
+  }
+}
+
+watch(viewKey, () => {
+  reviewing.value = null
+  refreshSnapshots()
+})
 
 function resetFilters() {
   filters.value = {}
@@ -133,5 +329,8 @@ function reload() {
   }
 }
 
-onMounted(reload)
+onMounted(() => {
+  reload()
+  refreshSnapshots()
+})
 </script>
